@@ -115,7 +115,16 @@ impl Context {
     fn expand_tilde(&self, value: &str) -> String {
         match (value.strip_prefix('~'), &self.home) {
             (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
-                format!("{}{}", home.to_string_lossy(), rest)
+                // Join as a path rather than concatenating strings: the config
+                // file writes `~/.ssh/...` with forward slashes, and on Windows
+                // a plain concat would keep them, producing a mixed-separator
+                // path. `Path::join` inserts the platform separator instead.
+                let joined = if rest.is_empty() {
+                    home.clone()
+                } else {
+                    home.join(rest.trim_start_matches(['/', '\\']))
+                };
+                joined.to_string_lossy().into_owned()
             }
             _ => value.to_string(),
         }
