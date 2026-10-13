@@ -222,6 +222,24 @@ impl<'a> ProgressReporter<'a> {
 /// What a cancelled transfer ends with, in the error the command returns.
 pub const TRANSFER_CANCELLED: &str = "transfer cancelled";
 
+/// The error a folder transfer with failed files ends with: how many made it
+/// and which did not. A cancel never gets here — it stops the whole copy
+/// where it stands (see `CancelFlag`).
+pub fn folder_failures(failures: &[(String, String)], planned: usize) -> AppError {
+    let mut message = format!("{} of {} files failed", failures.len(), planned);
+    for (path, reason) in failures.iter().take(10) {
+        message.push_str("; ");
+        message.push_str(path);
+        message.push_str(": ");
+        message.push_str(reason);
+    }
+    let rest = failures.len().saturating_sub(10);
+    if rest > 0 {
+        message.push_str(&format!("; and {rest} more"));
+    }
+    AppError::new(message)
+}
+
 /// A transfer's cancel flag: cloned into its request and polled between
 /// chunks, so a cancel takes effect within one 1 MiB read. Raised through
 /// `Transfers::cancel`; a request nobody can cancel gets a fresh one that

@@ -320,6 +320,9 @@ async fn watch_loop(
                     progress: Channel::<TransferProgress>::new(|_| Ok(())),
                     // A sync runs until it is done; nobody can cancel it.
                     cancel: CancelFlag::default(),
+                    // A sync always sends the whole file back: the local copy
+                    // is the newer one, not a partial of the remote's.
+                    resume: false,
                 },
             )
             .await;

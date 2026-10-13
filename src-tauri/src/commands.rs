@@ -663,6 +663,11 @@ pub async fn sftp_rename(
 /// `transfer`, on this and the three transfers below, is the id
 /// `cancel_transfer` can name while the copy runs; without one the transfer
 /// cannot be cancelled.
+///
+/// `resume` continues a copy an interrupted attempt started: the bytes
+/// already on the receiving side are kept and only the rest is sent (see
+/// `SftpRequest::Upload::resume`). Without it the copy replaces whatever is
+/// there, so a stale partial is never mistaken for this file's beginning.
 #[tauri::command]
 pub async fn sftp_download(
     state: State<'_, AppState>,
@@ -671,6 +676,7 @@ pub async fn sftp_download(
     local: String,
     on_progress: Channel<TransferProgress>,
     transfer: Option<String>,
+    resume: bool,
 ) -> Result<()> {
     let active = state.transfers.begin(transfer);
     state
@@ -682,6 +688,7 @@ pub async fn sftp_download(
                 local,
                 progress: on_progress,
                 cancel: active.flag(),
+                resume,
             },
         )
         .await?;
@@ -721,6 +728,7 @@ pub async fn sftp_upload(
     remote: String,
     on_progress: Channel<TransferProgress>,
     transfer: Option<String>,
+    resume: bool,
 ) -> Result<()> {
     let active = state.transfers.begin(transfer);
     state
@@ -732,6 +740,7 @@ pub async fn sftp_upload(
                 remote,
                 progress: on_progress,
                 cancel: active.flag(),
+                resume,
             },
         )
         .await?;

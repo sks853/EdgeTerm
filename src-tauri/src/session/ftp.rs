@@ -13,8 +13,8 @@ use tauri::AppHandle;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::transfer::{
-    ensure_local_directory, plan_local_upload, safe_local_child, validate_local_file_target,
-    CancelFlag, ProgressReporter,
+    ensure_local_directory, folder_failures, plan_local_upload, safe_local_child,
+    validate_local_file_target, CancelFlag, ProgressReporter,
 };
 use super::{
     emit_state, join_remote, sort_entries, SessionCommand, SftpRequest, SftpResponse,
@@ -398,6 +398,8 @@ fn run_ftp(connection: &mut FtpConnection, request: SftpRequest) -> Result<SftpR
             local,
             progress,
             cancel,
+            // FTP resume is not wired up yet; the flag is SFTP's for now.
+            resume: _,
         } => {
             download_file(&mut connection.stream, &remote, &local, &progress, &cancel)?;
             Ok(SftpResponse::Done)
@@ -416,6 +418,8 @@ fn run_ftp(connection: &mut FtpConnection, request: SftpRequest) -> Result<SftpR
             remote,
             progress,
             cancel,
+            // FTP resume is not wired up yet; the flag is SFTP's for now.
+            resume: _,
         } => {
             upload_file(&mut connection.stream, &local, &remote, &progress, &cancel)?;
             Ok(SftpResponse::Done)
@@ -671,11 +675,13 @@ fn download_directory(
         validate_local_file_target(&file.local)?;
     }
 
+    let planned = files.len();
     let mut reporter = ProgressReporter::begin(progress, total);
     let mut transferred = 0_u64;
-    for file in files {
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for file in &files {
         let completed_before_file = transferred;
-        let copied = copy_remote_file(
+        match copy_remote_file(
             &mut connection.stream,
             &file.remote,
             &file.local,
@@ -683,10 +689,22 @@ fn download_directory(
             |file_transferred| {
                 reporter.update(completed_before_file.saturating_add(file_transferred));
             },
-        )?;
-        transferred = transferred.saturating_add(copied);
+        ) {
+            Ok(copied) => transferred = transferred.saturating_add(copied),
+            Err(error) => {
+                // See the SFTP side: a cancel stops everything, one file's
+                // failure is noted and the rest still goes.
+                if cancel.is_cancelled() {
+                    return Err(error);
+                }
+                failures.push((file.remote.clone(), error.to_string()));
+            }
+        }
     }
     reporter.finish(transferred);
+    if !failures.is_empty() {
+        return Err(folder_failures(&failures, planned));
+    }
     Ok(())
 }
 
@@ -776,11 +794,13 @@ fn upload_directory(
         ensure_remote_directory(&mut connection.stream, directory)?;
     }
 
+    let planned = plan.files.len();
     let mut reporter = ProgressReporter::begin(progress, plan.total);
     let mut transferred = 0_u64;
-    for file in plan.files {
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for file in &plan.files {
         let completed_before_file = transferred;
-        let copied = copy_local_file(
+        match copy_local_file(
             &mut connection.stream,
             &file.local,
             &file.remote,
@@ -788,10 +808,22 @@ fn upload_directory(
             |file_transferred| {
                 reporter.update(completed_before_file.saturating_add(file_transferred));
             },
-        )?;
-        transferred = transferred.saturating_add(copied);
+        ) {
+            Ok(copied) => transferred = transferred.saturating_add(copied),
+            Err(error) => {
+                // See the SFTP side: a cancel stops everything, one file's
+                // failure is noted and the rest still goes.
+                if cancel.is_cancelled() {
+                    return Err(error);
+                }
+                failures.push((file.remote.clone(), error.to_string()));
+            }
+        }
     }
     reporter.finish(transferred);
+    if !failures.is_empty() {
+        return Err(folder_failures(&failures, planned));
+    }
     Ok(())
 }
 

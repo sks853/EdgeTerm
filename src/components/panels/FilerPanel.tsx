@@ -50,6 +50,17 @@ interface ActiveTransfer {
   cancelled: boolean;
 }
 
+/**
+ * A failed single-file copy the footer can continue; see `resumable`. The
+ * backend computes the offset itself, so only the two ends are kept.
+ */
+interface ResumableTransfer {
+  kind: "upload" | "download";
+  name: string;
+  local: string;
+  remote: string;
+}
+
 interface MenuState {
   x: number;
   y: number;
@@ -172,6 +183,13 @@ export function FilerPanel() {
   const [pendingDelete, setPendingDelete] = useState<FileEntry | null>(null);
   const [openWithApps, setOpenWithApps] = useState<string[]>(loadOpenWithApps);
   const [transfer, setTransfer] = useState<TransferState | null>(null);
+  /**
+   * The single-file transfer the footer offers to resume after a failure:
+   * the copy stopped part-way (a dropped connection, say), so what arrived
+   * is still on the receiving side and the rest can follow. Cleared when a
+   * new transfer starts, when the footer clears, and once resume is used.
+   */
+  const [resumable, setResumable] = useState<ResumableTransfer | null>(null);
   const [dragOver, setDragOver] = useState<DropVerdict | null>(null);
   const [dragOut, setDragOut] = useState<DragOutState | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -217,6 +235,7 @@ export function FilerPanel() {
       window.clearTimeout(transferClearTimer.current);
       transferClearTimer.current = null;
     }
+    setResumable(null);
     activeTransfer.current = cancellable
       ? { id: api.newTransferId(), cancelled: false }
       : null;
@@ -294,6 +313,7 @@ export function FilerPanel() {
     transferClearTimer.current = window.setTimeout(
       () => {
         setTransfer(null);
+        setResumable(null);
         transferClearTimer.current = null;
       },
       status === "error" ? 3000 : 1800,
@@ -310,6 +330,44 @@ export function FilerPanel() {
     if (!active || active.cancelled) return;
     active.cancelled = true;
     void api.cancelTransfer(active.id);
+  };
+
+  /**
+   * Continues the failed single-file copy in the footer. The backend keeps
+   * whatever already arrived on the receiving side and sends only the rest;
+   * if the partial was cleaned up in the meantime there is nothing to
+   * continue from, and the copy simply starts over — the file still
+   * arrives, just not any faster.
+   */
+  const resumeTransfer = async () => {
+    const target = resumable;
+    if (!target || !remoteId) return;
+    setResumable(null);
+    const transfer = beginTransfer(target.kind, target.name, true);
+    try {
+      if (target.kind === "upload") {
+        await api.sftpUpload(
+          remoteId,
+          target.local,
+          target.remote,
+          updateTransferProgress,
+          transfer,
+          true,
+        );
+      } else {
+        await api.sftpDownload(
+          remoteId,
+          target.remote,
+          target.local,
+          updateTransferProgress,
+          transfer,
+          true,
+        );
+      }
+      finishTransfer("complete");
+    } catch (e) {
+      failTransfer(e);
+    }
   };
 
   /** Ends the transfer a rejection belongs to: cancelled, or failed with `e`. */
@@ -466,6 +524,20 @@ export function FilerPanel() {
       }
       finishTransfer("complete");
     } catch (e) {
+      // A single file that stopped part-way can be continued from where it
+      // stopped; a folder copy has no one offset to continue from.
+      if (
+        !entry.isDir &&
+        activeTransfer.current &&
+        !activeTransfer.current.cancelled
+      ) {
+        setResumable({
+          kind: "download",
+          name: entry.name,
+          local: target,
+          remote: entry.path,
+        });
+      }
       failTransfer(e);
     } finally {
       setBusy(false);
@@ -480,11 +552,16 @@ export function FilerPanel() {
     busyRef.current = true;
     setBusy(true);
     setError(null);
+    // The file the loop is on, so a failure can offer to resume it.
+    let current: Omit<ResumableTransfer, "kind"> | null = null;
     try {
       for (const localPath of localPaths) {
         const name = localFileName(localPath);
         const isDirectory = await api.localIsDirectory(localPath);
         const transfer = beginTransfer("upload", name, true);
+        current = isDirectory
+          ? null
+          : { name, local: localPath, remote: joinRemote(destination, name) };
         if (isDirectory) {
           await api.sftpUploadDirectory(
             remoteId,
@@ -509,6 +586,9 @@ export function FilerPanel() {
       // Reload first: it clears the error line, and what did arrive should
       // show.
       await load(destination);
+      if (current && activeTransfer.current && !activeTransfer.current.cancelled) {
+        setResumable({ kind: "upload", ...current });
+      }
       failTransfer(e);
     } finally {
       busyRef.current = false;
@@ -1434,6 +1514,16 @@ export function FilerPanel() {
                   aria-label={`Cancel: ${transfer.name}`}
                 >
                   <Icon name="close" />
+                </button>
+              )}
+              {transfer.status === "error" && resumable && (
+                <button
+                  className="panel-action filer-action filer-transfer-resume"
+                  onClick={() => void resumeTransfer()}
+                  title="Resume"
+                  aria-label={`Resume: ${transfer.name}`}
+                >
+                  <Icon name="refresh" />
                 </button>
               )}
             </div>

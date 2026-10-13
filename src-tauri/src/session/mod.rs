@@ -57,6 +57,11 @@ pub enum SftpRequest {
         /// Raised by `cancel_transfer` and polled between chunks; a copy
         /// that stops on it leaves no half-written file behind.
         cancel: CancelFlag,
+        /// Continue a copy an interrupted attempt started: the bytes already
+        /// on the receiving side are kept and only the rest is sent. A plain
+        /// copy replaces whatever is there instead, so a partial left by
+        /// anything else is never mistaken for this file's beginning.
+        resume: bool,
     },
     DownloadDirectory {
         remote: String,
@@ -69,6 +74,8 @@ pub enum SftpRequest {
         remote: String,
         progress: Channel<TransferProgress>,
         cancel: CancelFlag,
+        /// See `Download::resume`.
+        resume: bool,
     },
     UploadDirectory {
         local: String,

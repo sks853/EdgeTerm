@@ -4847,6 +4847,13 @@ textarea:focus {
   margin: -3px -4px -3px 0;
 }
 
+.filer-transfer-resume {
+  flex: 0 0 20px;
+  width: 20px;
+  height: 20px;
+  margin: -3px -4px -3px 0;
+}
+
 .filer-transfer-track.is-indeterminate .filer-transfer-bar {
   width: 35%;
   animation: filer-transfer-indeterminate 1s ease-in-out infinite;

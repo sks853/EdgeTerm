@@ -26,8 +26,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use super::auth::{AuthPrompter, Challenge};
 use super::recording::Recorder;
 use super::transfer::{
-    ensure_local_directory, plan_local_upload, safe_local_child, validate_local_file_target,
-    CancelFlag, ProgressReporter,
+    ensure_local_directory, folder_failures, plan_local_upload, safe_local_child,
+    validate_local_file_target, CancelFlag, ProgressReporter,
 };
 use super::{
     emit_state, join_remote, locale, sort_entries, OutputPump, SessionCommand, SftpRequest,
@@ -1625,8 +1625,9 @@ async fn run_sftp(sftp: Arc<SftpSession>, request: SftpRequest) -> Result<SftpRe
             local,
             progress,
             cancel,
+            resume,
         } => {
-            download_file(&sftp, &remote, &local, &progress, &cancel).await?;
+            download_file(&sftp, &remote, &local, &progress, &cancel, resume).await?;
             Ok(SftpResponse::Done)
         }
         SftpRequest::DownloadDirectory {
@@ -1643,8 +1644,9 @@ async fn run_sftp(sftp: Arc<SftpSession>, request: SftpRequest) -> Result<SftpRe
             remote,
             progress,
             cancel,
+            resume,
         } => {
-            upload_file(&sftp, &local, &remote, &progress, &cancel).await?;
+            upload_file(&sftp, &local, &remote, &progress, &cancel, resume).await?;
             Ok(SftpResponse::Done)
         }
         SftpRequest::UploadDirectory {
@@ -1665,20 +1667,64 @@ async fn download_file(
     local: &str,
     progress: &tauri::ipc::Channel<TransferProgress>,
     cancel: &CancelFlag,
+    resume: bool,
 ) -> Result<()> {
     let total = sftp.metadata(remote).await?.size.unwrap_or(0);
+    let offset = if resume {
+        resume_offset_for_download(Path::new(local), total)
+    } else {
+        0
+    };
     let mut last_report = Instant::now();
 
-    report_transfer_progress(progress, 0, total);
-    let transferred = copy_remote_file(sftp, remote, Path::new(local), cancel, |transferred| {
-        if last_report.elapsed() >= TRANSFER_PROGRESS_INTERVAL {
-            report_transfer_progress(progress, transferred, total);
-            last_report = Instant::now();
-        }
-    })
+    report_transfer_progress(progress, offset, total);
+    let transferred = copy_remote_file(
+        sftp,
+        remote,
+        Path::new(local),
+        cancel,
+        offset,
+        |transferred| {
+            if last_report.elapsed() >= TRANSFER_PROGRESS_INTERVAL {
+                report_transfer_progress(progress, transferred, total);
+                last_report = Instant::now();
+            }
+        },
+    )
     .await?;
     report_transfer_progress(progress, transferred, total);
     Ok(())
+}
+
+/// Where a resumed download continues from: the local partial, when there is
+/// one shorter than the remote file. A partial that was deleted, or one that
+/// is already complete or longer (a different file under the same name),
+/// leaves nothing to continue from — and the copy starts over from zero
+/// rather than failing: the caller asked for this file to arrive, and a full
+/// copy is what that means now.
+///
+/// A partial that is shorter but holds *different* bytes (the name was
+/// reused) cannot be told apart from a genuine prefix without reading it
+/// back; resuming is the caller's explicit ask, as it is in every other
+/// client, so the bytes on the receiving side are trusted to be this file's.
+fn resume_offset_for_download(local: &Path, total: u64) -> u64 {
+    let size = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
+    if size < total {
+        size
+    } else {
+        0
+    }
+}
+
+/// The mirror image on the server: a remote partial shorter than the local
+/// file, or no file at all — see `resume_offset_for_download`.
+async fn resume_offset_for_upload(sftp: &SftpSession, remote: &str, total: u64) -> Result<u64> {
+    let size = match sftp.metadata(remote.to_string()).await {
+        Ok(metadata) => metadata.size.unwrap_or(0),
+        Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => 0,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(if size < total { size } else { 0 })
 }
 
 struct SftpDownloadJob {
@@ -1759,48 +1805,93 @@ async fn download_directory(
     .await
     .map_err(|error| AppError::new(format!("local folder preparation failed: {error}")))??;
 
+    let planned = files.len();
     let mut reporter = ProgressReporter::begin(progress, total);
     let mut transferred = 0_u64;
-    for file in files {
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for file in &files {
         let completed_before_file = transferred;
-        let copied = copy_remote_file(
+        match copy_remote_file(
             sftp,
             &file.remote,
             &file.local,
             cancel,
+            0,
             |file_transferred| {
                 reporter.update(completed_before_file.saturating_add(file_transferred));
             },
         )
-        .await?;
-        transferred = transferred.saturating_add(copied);
+        .await
+        {
+            Ok(copied) => transferred = transferred.saturating_add(copied),
+            Err(error) => {
+                // A cancel is the user's: the whole copy stops where it
+                // stands, as before. A file that failed on its own is noted
+                // and the copy carries on with the rest, so one unreadable
+                // file cannot cost the whole tree.
+                if cancel.is_cancelled() {
+                    return Err(error);
+                }
+                failures.push((file.remote.clone(), error.to_string()));
+            }
+        }
     }
     reporter.finish(transferred);
+    if !failures.is_empty() {
+        return Err(folder_failures(&failures, planned));
+    }
     Ok(())
 }
 
+/// Streams the remote file to disk. `offset` is how much of it is already
+/// there: the local file is opened for writing at that byte instead of being
+/// created empty, so a resumed copy writes only what is left. With `offset`
+/// 0 this is the ordinary whole-file copy. Progress is reported as absolute
+/// file positions, starting at `offset`.
 async fn copy_remote_file<F>(
     sftp: &SftpSession,
     remote: &str,
     local: &Path,
     cancel: &CancelFlag,
-    on_chunk: F,
+    offset: u64,
+    mut on_chunk: F,
 ) -> Result<u64>
 where
     F: FnMut(u64),
 {
+    use tokio::io::AsyncSeekExt;
+
     let mut source = sftp.open(remote).await?;
-    let mut target = tokio::fs::File::create(local).await?;
-    let copied = copy_in_chunks(&mut source, &mut target, cancel, on_chunk).await;
+    let mut target = if offset > 0 {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(local)
+            .await?;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        file
+    } else {
+        tokio::fs::File::create(local).await?
+    };
+    source.seek(std::io::SeekFrom::Start(offset)).await?;
+    let copied = copy_in_chunks(&mut source, &mut target, cancel, |sent| {
+        on_chunk(offset + sent)
+    })
+    .await;
     let transferred = match copied {
-        Ok(transferred) => transferred,
+        Ok(transferred) => offset + transferred,
         Err(error) => {
             // A cancelled copy leaves nothing behind: the truncated file
-            // would pass for the real one.
+            // would pass for the real one. A resumed one is rolled back to
+            // where this attempt started, so the bytes that arrived earlier
+            // survive for the next attempt.
             if cancel.is_cancelled() {
                 let _ = source.close().await;
-                drop(target);
-                let _ = tokio::fs::remove_file(local).await;
+                if offset == 0 {
+                    drop(target);
+                    let _ = tokio::fs::remove_file(local).await;
+                } else {
+                    let _ = target.set_len(offset).await;
+                }
             }
             return Err(error.into());
         }
@@ -1816,21 +1907,34 @@ async fn upload_file(
     remote: &str,
     progress: &tauri::ipc::Channel<TransferProgress>,
     cancel: &CancelFlag,
+    resume: bool,
 ) -> Result<()> {
     let metadata = tokio::fs::metadata(local).await?;
     if !metadata.is_file() {
         return Err(AppError::new("only regular files can be uploaded"));
     }
     let total = metadata.len();
+    let offset = if resume {
+        resume_offset_for_upload(sftp, remote, total).await?
+    } else {
+        0
+    };
     let mut last_report = Instant::now();
 
-    report_transfer_progress(progress, 0, total);
-    let transferred = copy_local_file(sftp, Path::new(local), remote, cancel, |transferred| {
-        if last_report.elapsed() >= TRANSFER_PROGRESS_INTERVAL {
-            report_transfer_progress(progress, transferred, total);
-            last_report = Instant::now();
-        }
-    })
+    report_transfer_progress(progress, offset, total);
+    let transferred = copy_local_file(
+        sftp,
+        Path::new(local),
+        remote,
+        cancel,
+        offset,
+        |transferred| {
+            if last_report.elapsed() >= TRANSFER_PROGRESS_INTERVAL {
+                report_transfer_progress(progress, transferred, total);
+                last_report = Instant::now();
+            }
+        },
+    )
     .await?;
     report_transfer_progress(progress, transferred, total);
     Ok(())
@@ -1854,23 +1958,39 @@ async fn upload_directory(
         ensure_remote_directory(sftp, directory).await?;
     }
 
+    let planned = plan.files.len();
     let mut reporter = ProgressReporter::begin(progress, plan.total);
     let mut transferred = 0_u64;
-    for file in plan.files {
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for file in &plan.files {
         let completed_before_file = transferred;
-        let copied = copy_local_file(
+        match copy_local_file(
             sftp,
             &file.local,
             &file.remote,
             cancel,
+            0,
             |file_transferred| {
                 reporter.update(completed_before_file.saturating_add(file_transferred));
             },
         )
-        .await?;
-        transferred = transferred.saturating_add(copied);
+        .await
+        {
+            Ok(copied) => transferred = transferred.saturating_add(copied),
+            Err(error) => {
+                // See `download_directory`: a cancel stops everything, a
+                // single file's failure is noted and the rest still goes.
+                if cancel.is_cancelled() {
+                    return Err(error);
+                }
+                failures.push((file.remote.clone(), error.to_string()));
+            }
+        }
     }
     reporter.finish(transferred);
+    if !failures.is_empty() {
+        return Err(folder_failures(&failures, planned));
+    }
     Ok(())
 }
 
@@ -1890,27 +2010,53 @@ async fn ensure_remote_directory(sftp: &SftpSession, path: &str) -> Result<()> {
     }
 }
 
+/// Streams the local file to the server. `offset` is how much of it is
+/// already there: the remote file is opened without truncating and both
+/// sides are positioned at that byte, so a resumed copy sends only what is
+/// left. With `offset` 0 this is the ordinary whole-file copy.
 async fn copy_local_file<F>(
     sftp: &SftpSession,
     local: &Path,
     remote: &str,
     cancel: &CancelFlag,
-    on_chunk: F,
+    offset: u64,
+    mut on_chunk: F,
 ) -> Result<u64>
 where
     F: FnMut(u64),
 {
+    use tokio::io::AsyncSeekExt;
+
     let mut source = tokio::fs::File::open(local).await?;
-    let mut target = sftp.create(remote).await?;
-    let copied = copy_in_chunks(&mut source, &mut target, cancel, on_chunk).await;
+    let mut target = if offset > 0 {
+        let mut file = sftp
+            .open_with_flags(remote, OpenFlags::WRITE | OpenFlags::CREATE)
+            .await?;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        file
+    } else {
+        sftp.create(remote).await?
+    };
+    source.seek(std::io::SeekFrom::Start(offset)).await?;
+    let copied = copy_in_chunks(&mut source, &mut target, cancel, |sent| {
+        on_chunk(offset + sent)
+    })
+    .await;
     let transferred = match copied {
-        Ok(transferred) => transferred,
+        Ok(transferred) => offset + transferred,
         Err(error) => {
             // A cancelled upload takes its half-written file off the server
-            // too, once the handle is closed.
+            // too, once the handle is closed — unless this is a resume, whose
+            // file is rolled back to `offset` so what arrived earlier stays.
             if cancel.is_cancelled() {
                 let _ = target.shutdown().await;
-                let _ = sftp.remove_file(remote).await;
+                if offset == 0 {
+                    let _ = sftp.remove_file(remote).await;
+                } else {
+                    let mut attrs = russh_sftp::protocol::FileAttributes::empty();
+                    attrs.size = Some(offset);
+                    let _ = target.set_metadata(attrs).await;
+                }
             }
             return Err(error.into());
         }
@@ -1977,8 +2123,8 @@ mod tests {
         copy_in_chunks, ensure_sftp, handshake_failure, legacy_choices, open_shell,
         replace_host_key, run_sftp, saved_answer, verify_host_key, AuthPrompter, CancelFlag,
         Client, ConnectOutcome, Endpoint, Handle, HandshakeError, Hops, LegacyRecord, Prompt,
-        SftpConnectOutcome, SftpRequest, SftpResponse, SharedTransport, SshTransports,
-        SAVED_PASSWORD_REJECTED, TRANSFER_CHUNK_SIZE,
+        SftpConnectOutcome, SftpRequest, SftpResponse, SftpSession, SharedTransport, SshTransports,
+        TransferProgress, SAVED_PASSWORD_REJECTED, TRANSFER_CHUNK_SIZE,
     };
     use crate::model::{AuthKind, AuthPromptField, SessionKind, SessionProfile};
     use crate::session::auth::CannedAnswers;
@@ -2224,6 +2370,7 @@ mod tests {
                 local: local.to_string_lossy().into_owned(),
                 progress,
                 cancel,
+                resume: false,
             },
         )
         .await;
@@ -3471,5 +3618,841 @@ mod tests {
             None,
             "the saved password is offered once; a second refusal is the user's to answer"
         );
+    }
+
+    // --- live transfer reproduction ------------------------------------------
+    //
+    // Reproduction of the two transfer defects found in review, against a real
+    // SFTP server, so they are ignored by default. Run them with:
+    //
+    //   MSYS_NO_PATHCONV=1 \   # Git Bash rewrites /... arguments otherwise
+    //   EDGETERM_TEST_TARGET=admin@172.16.2.93:12580 \
+    //   EDGETERM_TEST_KEY=F:/workspace/id_rsa \
+    //   EDGETERM_TEST_DIR=/home/admin/workspace/HDM/edgeterm-test \
+    //   EDGETERM_TEST_SCRATCH=F:/workspace/EdgeTerm/.workbuddy/tmp/live \
+    //   cargo test -- --ignored live_ --test-threads=1 --nocapture
+    //
+    // `EDGETERM_TEST_DIR` is a scratch directory on the server; the tests
+    // create and remove their own files inside it. `EDGETERM_TEST_SCRATCH`
+    // (default: the OS temp directory) holds the local copies and a private
+    // HOME, so the developer's own `known_hosts` is never touched — which is
+    // also why these must run one at a time.
+    //
+    // Every connection goes through a TCP proxy the test itself runs, so the
+    // "network" can be cut mid-transfer by closing both of its ends: the shape
+    // a real connection drop takes. A graceful SSH disconnect is not a
+    // substitute — it leaves an in-flight SFTP write waiting for a reply that
+    // never comes, and the transfer future hangs instead of failing.
+
+    /// The scratch directory on the server the live tests work inside.
+    fn live_dir() -> String {
+        std::env::var("EDGETERM_TEST_DIR").unwrap_or_else(|_| "/tmp/edgeterm-live".to_string())
+    }
+
+    /// A private HOME for one live test: an empty `.ssh` the accept-new host
+    /// key policy can record its first-seen entry into.
+    fn live_home(tag: &str) -> PathBuf {
+        let root = std::env::var("EDGETERM_TEST_SCRATCH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let home = root.join(format!("edgeterm-live-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".ssh")).expect("create scratch .ssh");
+        std::env::set_var("HOME", &home);
+        home
+    }
+
+    /// A file of `mib` MiB with a repeating pattern: cheap to write, and its
+    /// content can be re-read and verified without holding it in memory.
+    fn write_sized_file(path: &Path, mib: u64) -> u64 {
+        use std::io::Write as _;
+        let block: Vec<u8> = (0..1024 * 1024u32)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut file = std::fs::File::create(path).expect("create local file");
+        for _ in 0..mib {
+            file.write_all(&block).expect("write block");
+        }
+        file.sync_all().expect("flush local file");
+        file.metadata().expect("stat local file").len()
+    }
+
+    /// The switch that cuts the connection a live test talks over.
+    struct LiveLink {
+        cut: Arc<tokio::sync::Notify>,
+    }
+
+    /// Connects to the live server through a one-connection TCP proxy, so the
+    /// link can be cut mid-transfer. The host key is checked against a
+    /// scratch `known_hosts` (the handler's own override) rather than the
+    /// developer's file — `dirs::home_dir` cannot be redirected on Windows,
+    /// so a production-path connection would record the proxy's host key
+    /// into the real one. The transport is returned with the session so
+    /// dropping it takes the connection down.
+    async fn live_sftp(
+        profile: &SessionProfile,
+    ) -> (Arc<SharedTransport>, Arc<SftpSession>, LiveLink) {
+        let host = profile.host.clone().expect("a host");
+        let port = profile.port.expect("a port");
+        let upstream: SocketAddr = format!("{host}:{port}")
+            .parse()
+            .expect("the target is an address");
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind the proxy");
+        let local = listener.local_addr().expect("the proxy's address");
+        let cut = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn({
+            let cut = cut.clone();
+            async move {
+                let Ok((client, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(server) = tokio::net::TcpStream::connect(upstream).await else {
+                    return;
+                };
+                let (mut from_client, mut to_client) = tokio::io::split(client);
+                let (mut from_server, mut to_server) = tokio::io::split(server);
+                let up = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut from_client, &mut to_server).await;
+                });
+                let down = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
+                });
+                cut.notified().await;
+                up.abort();
+                down.abort();
+            }
+        });
+
+        let root = std::env::var("EDGETERM_TEST_SCRATCH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let known_hosts_dir = root.join(format!("edgeterm-live-hosts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&known_hosts_dir).expect("create the scratch hosts dir");
+        let known_hosts = known_hosts_dir.join("known_hosts");
+        std::fs::write(&known_hosts, b"").expect("create the scratch known_hosts");
+
+        let username = profile.username.clone().unwrap_or_default();
+        let user = Mutex::new(CannedAnswers::default());
+        let prompter = AuthPrompter::canned(&user);
+        let mut handle = client::connect(
+            Arc::new(client_config()),
+            local,
+            Client {
+                host: "127.0.0.1".into(),
+                port: local.port(),
+                legacy: LegacyRecord::default(),
+                known_hosts: Some(known_hosts),
+            },
+        )
+        .await
+        .expect("handshake through the proxy");
+        authenticate(
+            &mut handle,
+            profile,
+            &username,
+            &format!("{host}:{port}"),
+            &prompter,
+        )
+        .await
+        .expect("authentication");
+        let transport = Arc::new(SharedTransport {
+            handle: Arc::new(handle),
+            hops: Some(Hops(Vec::new())),
+            legacy: Vec::new(),
+            endpoint: Endpoint::of(profile),
+        });
+        let mut slot = None;
+        let session = ensure_sftp(&transport.handle, &mut slot)
+            .await
+            .expect("sftp subsystem");
+        (transport, session, LiveLink { cut })
+    }
+
+    /// How long a full transfer may take before the test gives up on it.
+    const TRANSFER_DEADLINE: Duration = Duration::from_secs(300);
+
+    /// How long an interrupted attempt is waited on. The connection is cut
+    /// under it, and a cut connection does not always bring the copy back on
+    /// its own: the SFTP write path has no deadline of its own, so an
+    /// in-flight write can sit waiting for acknowledgements that will never
+    /// arrive (recovery in the app leans on the 30 s × 3 keepalive). The test
+    /// treats "never came back" as the failure the drop causes.
+    const INTERRUPTED_DEADLINE: Duration = Duration::from_secs(60);
+
+    /// Runs one SFTP transfer request, reporting a transfer that does not
+    /// come back on its own as a failure rather than hanging the test.
+    async fn run_transfer(
+        session: Arc<SftpSession>,
+        request: SftpRequest,
+    ) -> crate::error::Result<()> {
+        run_with_deadline(session, request, TRANSFER_DEADLINE).await
+    }
+
+    /// The same for an attempt the test cuts short: the deadline is the one
+    /// the interrupted copy is waited on.
+    async fn run_interrupted(
+        session: Arc<SftpSession>,
+        request: SftpRequest,
+    ) -> crate::error::Result<()> {
+        run_with_deadline(session, request, INTERRUPTED_DEADLINE).await
+    }
+
+    async fn run_with_deadline(
+        session: Arc<SftpSession>,
+        request: SftpRequest,
+        deadline: Duration,
+    ) -> crate::error::Result<()> {
+        match tokio::time::timeout(deadline, run_sftp(session, request)).await {
+            Ok(outcome) => outcome.map(|_| ()),
+            Err(_) => Err(crate::error::AppError::new(
+                "the transfer never came back after the connection dropped",
+            )),
+        }
+    }
+
+    /// Seeds a file on the server, creating or replacing it. The session's
+    /// own `write` opens with WRITE alone, so the file has to exist first.
+    async fn seed_file(session: &SftpSession, path: &str, data: &[u8]) {
+        use russh_sftp::protocol::OpenFlags;
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = session
+            .open_with_flags(
+                path,
+                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+            )
+            .await
+            .expect("open the seed for writing");
+        file.write_all(data).await.expect("write the seed");
+        file.shutdown().await.expect("close the seed");
+    }
+
+    /// A progress channel that records the `transferred` count of every
+    /// report, so a test can watch a copy advance and measure how much a
+    /// retry re-sends.
+    fn byte_reporting_progress(log: Arc<Mutex<Vec<u64>>>) -> tauri::ipc::Channel<TransferProgress> {
+        tauri::ipc::Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = &body {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                    if let Some(transferred) = value.get("transferred").and_then(|v| v.as_u64()) {
+                        log.lock().push(transferred);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Cuts the link once the copy has put `bytes` on the wire — the way a
+    /// network interruption arrives, with no cancel flag involved.
+    async fn cut_after(link: Arc<tokio::sync::Notify>, log: Arc<Mutex<Vec<u64>>>, bytes: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while log.lock().last().copied().unwrap_or(0) < bytes {
+            if std::time::Instant::now() > deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        link.notify_one();
+    }
+
+    /// Streams a remote file and checks every 1 MiB block against the
+    /// pattern `write_sized_file` produced, so a resumed copy is proven
+    /// byte-for-byte without a second full copy on disk.
+    async fn verify_remote_sized_file(sftp: &SftpSession, path: &str, mib: u64) {
+        use tokio::io::AsyncReadExt as _;
+        let block: Vec<u8> = (0..1024 * 1024u32)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut file = sftp.open(path).await.expect("open the remote copy");
+        let mut buffer = vec![0; 1024 * 1024];
+        for index in 0..mib {
+            let mut filled = 0;
+            while filled < buffer.len() {
+                let read = file
+                    .read(&mut buffer[filled..])
+                    .await
+                    .expect("read a block");
+                assert!(read > 0, "block {index} ended early");
+                filled += read;
+            }
+            assert_eq!(buffer, block, "block {index} matches the source");
+        }
+        assert_eq!(
+            file.read(&mut buffer).await.expect("read the end"),
+            0,
+            "the copy is exactly the source"
+        );
+        let _ = file.close().await;
+    }
+
+    /// The same check for a file on disk.
+    fn verify_local_sized_file(path: &Path, mib: u64) {
+        use std::io::Read as _;
+        let block: Vec<u8> = (0..1024 * 1024u32)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut file = std::fs::File::open(path).expect("open the local copy");
+        let mut buffer = vec![0; 1024 * 1024];
+        for index in 0..mib {
+            file.read_exact(&mut buffer).expect("read a block");
+            assert_eq!(buffer, block, "block {index} matches the source");
+        }
+        assert_eq!(
+            file.read(&mut buffer).expect("read the end"),
+            0,
+            "the copy is exactly the source"
+        );
+    }
+
+    /// Where a copy's progress reports started and ended: a resume starts at
+    /// the partial, a start-over at zero, and both end at the full size.
+    fn progress_span(log: &Arc<Mutex<Vec<u64>>>) -> (u64, u64) {
+        let reports = log.lock();
+        (
+            *reports.first().expect("a start report"),
+            *reports.last().expect("a final report"),
+        )
+    }
+
+    /// The resume after the partial was deleted: the connection dropped, the
+    /// half-written file was cleaned up before the resume, and the resume
+    /// starts the copy over rather than failing — the caller asked for the
+    /// file to arrive, and a full copy is what that means now.
+    #[tokio::test]
+    #[ignore]
+    async fn live_an_upload_resume_after_the_partial_was_deleted_starts_over() {
+        let home = live_home("resume-deleted-up");
+        let profile = profile_from_env("EDGETERM_TEST_TARGET");
+        let remote = format!("{}/resume-deleted-up.bin", live_dir());
+        let local = home.join("resume-deleted-up.bin");
+        let total = write_sized_file(&local, 128);
+
+        let (conn, session, link) = live_sftp(&profile).await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cutter = tokio::spawn(cut_after(link.cut.clone(), log.clone(), 8 * 1024 * 1024));
+        let outcome = run_interrupted(
+            session.clone(),
+            SftpRequest::Upload {
+                local: local.to_string_lossy().into_owned(),
+                remote: remote.clone(),
+                progress: byte_reporting_progress(log.clone()),
+                cancel: CancelFlag::default(),
+                resume: false,
+            },
+        )
+        .await;
+        let _ = cutter.await;
+        outcome.expect_err("the dropped connection fails the upload");
+        drop((conn, session));
+
+        // The partial is gone before the resume arrives — cleaned up by a
+        // later pass over the folder, say.
+        let (conn, session, _link) = live_sftp(&profile).await;
+        let partial = session
+            .metadata(remote.clone())
+            .await
+            .expect("the partial file is still on the server")
+            .size
+            .unwrap_or(0);
+        assert!(
+            partial > 0 && partial < total,
+            "the transfer stopped part-way"
+        );
+        let _ = session.remove_file(remote.clone()).await;
+        assert!(
+            session.metadata(remote.clone()).await.is_err(),
+            "the partial is gone"
+        );
+
+        // The resume has nothing to continue from, so it starts over.
+        let retry = Arc::new(Mutex::new(Vec::new()));
+        run_transfer(
+            session.clone(),
+            SftpRequest::Upload {
+                local: local.to_string_lossy().into_owned(),
+                remote: remote.clone(),
+                progress: byte_reporting_progress(retry.clone()),
+                cancel: CancelFlag::default(),
+                resume: true,
+            },
+        )
+        .await
+        .expect("the resume starts the copy over");
+        let (first, last) = progress_span(&retry);
+        assert_eq!(first, 0, "it starts from the beginning");
+        assert_eq!(last, total, "and sends everything");
+        verify_remote_sized_file(&session, &remote, 128).await;
+
+        let _ = session.remove_file(remote).await;
+        drop((conn, session));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The mirror image on the way down: the local partial is deleted before
+    /// the resume, and the download starts over rather than failing.
+    #[tokio::test]
+    #[ignore]
+    async fn live_a_download_resume_after_the_partial_was_deleted_starts_over() {
+        let home = live_home("resume-deleted-down");
+        let profile = profile_from_env("EDGETERM_TEST_TARGET");
+        let remote = format!("{}/resume-deleted-down.bin", live_dir());
+        let local = home.join("resume-deleted-down.bin");
+        let total = write_sized_file(&local, 128);
+
+        let (conn, session, link) = live_sftp(&profile).await;
+        run_transfer(
+            session.clone(),
+            SftpRequest::Upload {
+                local: local.to_string_lossy().into_owned(),
+                remote: remote.clone(),
+                progress: byte_reporting_progress(Arc::new(Mutex::new(Vec::new()))),
+                cancel: CancelFlag::default(),
+                resume: false,
+            },
+        )
+        .await
+        .expect("the seed upload succeeds");
+        let _ = std::fs::remove_file(&local);
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cutter = tokio::spawn(cut_after(link.cut.clone(), log.clone(), 8 * 1024 * 1024));
+        let outcome = run_interrupted(
+            session.clone(),
+            SftpRequest::Download {
+                remote: remote.clone(),
+                local: local.to_string_lossy().into_owned(),
+                progress: byte_reporting_progress(log.clone()),
+                cancel: CancelFlag::default(),
+                resume: false,
+            },
+        )
+        .await;
+        let _ = cutter.await;
+        outcome.expect_err("the dropped connection fails the download");
+        drop((conn, session));
+
+        // The partial copy is gone before the resume arrives.
+        let partial = std::fs::metadata(&local)
+            .expect("the partial copy is still on disk")
+            .len();
+        assert!(
+            partial > 0 && partial < total,
+            "the transfer stopped part-way"
+        );
+        let _ = std::fs::remove_file(&local);
+
+        let (conn, session, _link) = live_sftp(&profile).await;
+        let retry = Arc::new(Mutex::new(Vec::new()));
+        run_transfer(
+            session.clone(),
+            SftpRequest::Download {
+                remote: remote.clone(),
+                local: local.to_string_lossy().into_owned(),
+                progress: byte_reporting_progress(retry.clone()),
+                cancel: CancelFlag::default(),
+                resume: true,
+            },
+        )
+        .await
+        .expect("the resume starts the copy over");
+        let (first, last) = progress_span(&retry);
+        assert_eq!(first, 0, "it starts from the beginning");
+        assert_eq!(last, total, "and reads everything");
+        verify_local_sized_file(&local, 128);
+
+        let _ = session.remove_file(remote).await;
+        drop((conn, session));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The interrupted-upload defect, fixed: the connection is torn down
+    /// mid-transfer, the server keeps the half-written file, and a resumed
+    /// retry sends only what is left — and what lands is the whole file.
+    #[tokio::test]
+    #[ignore]
+    async fn live_a_resumed_upload_sends_only_the_remainder() {
+        let home = live_home("upload-resume");
+        let profile = profile_from_env("EDGETERM_TEST_TARGET");
+        let remote = format!("{}/resume-upload.bin", live_dir());
+        let local = home.join("resume-upload.bin");
+        let total = write_sized_file(&local, 128);
+
+        // The first attempt: the connection goes away once 8 MiB are on the
+        // wire.
+        let (conn, session, link) = live_sftp(&profile).await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cutter = tokio::spawn(cut_after(link.cut.clone(), log.clone(), 8 * 1024 * 1024));
+        let outcome = run_interrupted(
+            session.clone(),
+            SftpRequest::Upload {
+                local: local.to_string_lossy().into_owned(),
+                remote: remote.clone(),
+                progress: byte_reporting_progress(log.clone()),
+                cancel: CancelFlag::default(),
+                resume: false,
+            },
+        )
+        .await;
+        let _ = cutter.await;
+        let error = outcome
+            .expect_err("the dropped connection fails the upload")
+            .to_string();
+        assert!(
+            !error.contains("transfer cancelled"),
+            "a connection drop is not a user cancel: {error}"
+        );
+        drop((conn, session));
+
+        // The half-written file is still on the server.
+        let (conn, session, _link) = live_sftp(&profile).await;
+        let partial = session
+            .metadata(remote.clone())
+            .await
+            .expect("the partial file is still on the server")
+            .size
+            .unwrap_or(0);
+        println!("fix: after the drop the server holds {partial} of {total} bytes");
+        assert!(
+            partial > 0 && partial < total,
+            "the transfer stopped part-way"
+        );
+
+        // The resume: it starts where the drop left off and sends only the
+        // remainder.
+        let retry = Arc::new(Mutex::new(Vec::new()));
+        run_transfer(
+            session.clone(),
+            SftpRequest::Upload {
+                local: local.to_string_lossy().into_owned(),
+                remote: remote.clone(),
+                progress: byte_reporting_progress(retry.clone()),
+                cancel: CancelFlag::default(),
+                resume: true,
+            },
+        )
+        .await
+        .expect("the resume succeeds");
+        let (first, last) = progress_span(&retry);
+        println!("fix: the resume ran {first} → {last} of {total} bytes");
+        assert_eq!(first, partial, "it continues from the partial");
+        assert_eq!(last, total, "and runs to the end");
+        assert_eq!(last - first, total - partial, "only the remainder is sent");
+
+        // What landed is the whole file, not a splice of the two attempts.
+        verify_remote_sized_file(&session, &remote, 128).await;
+
+        let _ = session.remove_file(remote).await;
+        drop((conn, session));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The mirror image on the way down: a dropped download leaves a partial
+    /// local copy, and the resume reads only the remainder of the remote file
+    /// into it.
+    #[tokio::test]
+    #[ignore]
+    async fn live_a_resumed_download_reads_only_the_remainder() {
+        let home = live_home("download-resume");
+        let profile = profile_from_env("EDGETERM_TEST_TARGET");
+        let remote = format!("{}/resume-download.bin", live_dir());
+        let local = home.join("resume-download.bin");
+        let total = write_sized_file(&local, 128);
+
+        // Seed the server with a complete copy first.
+        let (conn, session, link) = live_sftp(&profile).await;
+        run_transfer(
+            session.clone(),
+            SftpRequest::Upload {
+                local: local.to_string_lossy().into_owned(),
+                remote: remote.clone(),
+                progress: byte_reporting_progress(Arc::new(Mutex::new(Vec::new()))),
+                cancel: CancelFlag::default(),
+                resume: false,
+            },
+        )
+        .await
+        .expect("the seed upload succeeds");
+        let _ = std::fs::remove_file(&local);
+
+        // The first attempt: the connection goes away once 8 MiB are down.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cutter = tokio::spawn(cut_after(link.cut.clone(), log.clone(), 8 * 1024 * 1024));
+        let outcome = run_interrupted(
+            session.clone(),
+            SftpRequest::Download {
+                remote: remote.clone(),
+                local: local.to_string_lossy().into_owned(),
+                progress: byte_reporting_progress(log.clone()),
+                cancel: CancelFlag::default(),
+                resume: false,
+            },
+        )
+        .await;
+        let _ = cutter.await;
+        let error = outcome
+            .expect_err("the dropped connection fails the download")
+            .to_string();
+        assert!(
+            !error.contains("transfer cancelled"),
+            "a connection drop is not a user cancel: {error}"
+        );
+        drop((conn, session));
+
+        // The partial copy is still on disk.
+        let partial = std::fs::metadata(&local)
+            .expect("the partial copy is still on disk")
+            .len();
+        println!("fix: after the drop the local copy holds {partial} of {total} bytes");
+        assert!(
+            partial > 0 && partial < total,
+            "the transfer stopped part-way"
+        );
+
+        // The resume: only the remainder is read.
+        let (conn, session, _link) = live_sftp(&profile).await;
+        let retry = Arc::new(Mutex::new(Vec::new()));
+        run_transfer(
+            session.clone(),
+            SftpRequest::Download {
+                remote: remote.clone(),
+                local: local.to_string_lossy().into_owned(),
+                progress: byte_reporting_progress(retry.clone()),
+                cancel: CancelFlag::default(),
+                resume: true,
+            },
+        )
+        .await
+        .expect("the resume succeeds");
+        let (first, last) = progress_span(&retry);
+        println!("fix: the resume ran {first} → {last} of {total} bytes");
+        assert_eq!(first, partial, "it continues from the partial");
+        assert_eq!(last, total, "and runs to the end");
+        assert_eq!(last - first, total - partial, "only the remainder is read");
+        assert_eq!(std::fs::metadata(&local).expect("stat").len(), total);
+        verify_local_sized_file(&local, 128);
+
+        let _ = session.remove_file(remote).await;
+        drop((conn, session));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A retry that does not ask for a resume still replaces the partial:
+    /// resuming is the caller's to ask for, so a stale partial is never
+    /// mistaken for this file's beginning.
+    #[tokio::test]
+    #[ignore]
+    async fn live_a_plain_retry_after_a_drop_replaces_the_partial() {
+        let home = live_home("upload-plain");
+        let profile = profile_from_env("EDGETERM_TEST_TARGET");
+        let remote = format!("{}/plain-retry.bin", live_dir());
+        let local = home.join("plain-retry.bin");
+        let total = write_sized_file(&local, 128);
+
+        let (conn, session, link) = live_sftp(&profile).await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cutter = tokio::spawn(cut_after(link.cut.clone(), log.clone(), 8 * 1024 * 1024));
+        let outcome = run_interrupted(
+            session.clone(),
+            SftpRequest::Upload {
+                local: local.to_string_lossy().into_owned(),
+                remote: remote.clone(),
+                progress: byte_reporting_progress(log.clone()),
+                cancel: CancelFlag::default(),
+                resume: false,
+            },
+        )
+        .await;
+        let _ = cutter.await;
+        outcome.expect_err("the dropped connection fails the upload");
+        drop((conn, session));
+
+        let (conn, session, _link) = live_sftp(&profile).await;
+        let partial = session
+            .metadata(remote.clone())
+            .await
+            .expect("the partial file is still on the server")
+            .size
+            .unwrap_or(0);
+        assert!(
+            partial > 0 && partial < total,
+            "the transfer stopped part-way"
+        );
+
+        let retry = Arc::new(Mutex::new(Vec::new()));
+        run_transfer(
+            session.clone(),
+            SftpRequest::Upload {
+                local: local.to_string_lossy().into_owned(),
+                remote: remote.clone(),
+                progress: byte_reporting_progress(retry.clone()),
+                cancel: CancelFlag::default(),
+                resume: false,
+            },
+        )
+        .await
+        .expect("the plain retry succeeds");
+        let (first, last) = progress_span(&retry);
+        assert_eq!(first, 0, "it starts over");
+        assert_eq!(last, total, "and sends everything");
+        verify_remote_sized_file(&session, &remote, 128).await;
+
+        let _ = session.remove_file(remote).await;
+        drop((conn, session));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The folder-upload defect, fixed: a file the server refuses is noted,
+    /// the rest of the tree still goes, and the transfer ends by naming what
+    /// did not make it.
+    #[tokio::test]
+    #[ignore]
+    async fn live_a_folder_upload_skips_a_refused_file_and_reports_it() {
+        let home = live_home("folder-upload");
+        let profile = profile_from_env("EDGETERM_TEST_TARGET");
+        let source = home.join("upload-tree");
+        std::fs::create_dir_all(&source).expect("create the local tree");
+        let block = vec![3u8; 4 * 1024 * 1024];
+        for name in ["a.bin", "m-blocker", "z.bin"] {
+            std::fs::write(source.join(name), &block).expect("write a local file");
+        }
+        let base = format!("{}/skip-up-{}", live_dir(), uuid::Uuid::new_v4());
+        let (conn, session, _link) = live_sftp(&profile).await;
+        session
+            .create_dir(base.clone())
+            .await
+            .expect("create the remote folder");
+        // A directory where the middle file of the plan is headed: the server
+        // refuses to open it as a file.
+        session
+            .create_dir(format!("{base}/m-blocker"))
+            .await
+            .expect("create the blocker directory");
+
+        let outcome = run_transfer(
+            session.clone(),
+            SftpRequest::UploadDirectory {
+                local: source.to_string_lossy().into_owned(),
+                remote: base.clone(),
+                progress: byte_reporting_progress(Arc::new(Mutex::new(Vec::new()))),
+                cancel: CancelFlag::default(),
+            },
+        )
+        .await;
+        let error = outcome
+            .expect_err("the refused file still fails the transfer")
+            .to_string();
+        println!("fix: the folder upload ended with: {error}");
+        assert!(
+            error.contains("1 of 3 files failed"),
+            "the failure is counted: {error}"
+        );
+        assert!(
+            error.contains("m-blocker"),
+            "and the file is named: {error}"
+        );
+
+        // The files around it arrived.
+        for name in ["a.bin", "z.bin"] {
+            assert_eq!(
+                session
+                    .metadata(format!("{base}/{name}"))
+                    .await
+                    .expect("the file was sent")
+                    .size,
+                Some(4 * 1024 * 1024),
+                "{name} arrived complete"
+            );
+        }
+
+        let _ = session.remove_file(format!("{base}/a.bin")).await;
+        let _ = session.remove_file(format!("{base}/z.bin")).await;
+        let _ = session.remove_dir(format!("{base}/m-blocker")).await;
+        let _ = session.remove_dir(base).await;
+        drop((conn, session));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The mirror image on the way down: an unreadable file is noted, every
+    /// readable file in the tree still arrives, and the transfer ends by
+    /// naming what did not.
+    #[tokio::test]
+    #[ignore]
+    async fn live_a_folder_download_skips_an_unreadable_file_and_reports_it() {
+        let home = live_home("folder-download");
+        let profile = profile_from_env("EDGETERM_TEST_TARGET");
+        let base = format!("{}/skip-down-{}", live_dir(), uuid::Uuid::new_v4());
+        let (conn, session, _link) = live_sftp(&profile).await;
+
+        session
+            .create_dir(base.clone())
+            .await
+            .expect("create the folder");
+        let block = vec![7u8; 4 * 1024 * 1024];
+        for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
+            seed_file(&session, &format!("{base}/{name}"), &block).await;
+        }
+        let locked = format!("{base}/locked.bin");
+        seed_file(&session, &locked, &vec![9u8; 1024 * 1024]).await;
+        let mut attrs = session
+            .metadata(locked.clone())
+            .await
+            .expect("stat the locked file");
+        attrs.permissions = Some(0o000);
+        session
+            .set_metadata(locked.clone(), attrs)
+            .await
+            .expect("chmod 000 the locked file");
+
+        let target = home.join("skip-target");
+        let outcome = run_transfer(
+            session.clone(),
+            SftpRequest::DownloadDirectory {
+                remote: base.clone(),
+                local: target.to_string_lossy().into_owned(),
+                progress: byte_reporting_progress(Arc::new(Mutex::new(Vec::new()))),
+                cancel: CancelFlag::default(),
+            },
+        )
+        .await;
+        let error = outcome
+            .expect_err("the unreadable file still fails the transfer")
+            .to_string();
+        println!("fix: the folder download ended with: {error}");
+        assert!(
+            error.contains("1 of 5 files failed"),
+            "the failure is counted: {error}"
+        );
+        assert!(
+            error.contains("locked.bin"),
+            "and the file is named: {error}"
+        );
+
+        // Every readable file arrived, complete.
+        for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
+            let path = target.join(name);
+            let data = std::fs::read(&path).expect("the readable file arrived");
+            assert_eq!(data.len(), 4 * 1024 * 1024, "{name} is complete");
+            assert!(data.iter().all(|byte| *byte == 7), "{name} is intact");
+        }
+        assert!(
+            !target.join("locked.bin").exists(),
+            "the unreadable file is not half-copied"
+        );
+
+        // Leave the server as it was found.
+        let mut attrs = session
+            .metadata(locked.clone())
+            .await
+            .expect("stat the locked file");
+        attrs.permissions = Some(0o644);
+        let _ = session.set_metadata(locked.clone(), attrs).await;
+        let _ = session.remove_file(locked).await;
+        for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
+            let _ = session.remove_file(format!("{base}/{name}")).await;
+        }
+        let _ = session.remove_dir(base).await;
+        drop((conn, session));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

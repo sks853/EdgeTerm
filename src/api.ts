@@ -265,6 +265,12 @@ export const sftpRename = (id: string, from: string, to: string) =>
  * `transfer`, on the four transfers below, is an id from `newTransferId`
  * that `cancelTransfer` can name while the copy runs; a transfer without
  * one cannot be cancelled.
+ *
+ * `resume` continues a copy an interrupted attempt started: the bytes
+ * already on the receiving side are kept and only the rest is sent. The
+ * backend works the offset out itself, so the caller does not need to know
+ * how much arrived — and if the partial was cleaned up in the meantime, the
+ * copy simply starts over.
  */
 export const sftpDownload = (
   id: string,
@@ -272,6 +278,7 @@ export const sftpDownload = (
   local: string,
   onProgress: (progress: TransferProgress) => void,
   transfer?: string,
+  resume = false,
 ) => {
   const progress = new Channel<TransferProgress>();
   progress.onmessage = onProgress;
@@ -281,6 +288,7 @@ export const sftpDownload = (
     local,
     onProgress: progress,
     transfer,
+    resume,
   });
 };
 
@@ -308,6 +316,7 @@ export const sftpUpload = (
   remote: string,
   onProgress: (progress: TransferProgress) => void,
   transfer?: string,
+  resume = false,
 ) => {
   const progress = new Channel<TransferProgress>();
   progress.onmessage = onProgress;
@@ -317,6 +326,7 @@ export const sftpUpload = (
     remote,
     onProgress: progress,
     transfer,
+    resume,
   });
 };
 
