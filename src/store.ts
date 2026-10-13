@@ -86,6 +86,13 @@ export interface Tab {
   rows: number;
   /** The pane whose strip shows this tab; see `AppStore.panes`. */
   paneId: string;
+  /**
+   * The SSH session this tab's SFTP view belongs to, for the companion tab
+   * an SSH connection opens automatically: it runs on that session's
+   * connection, is not a saved session, and closes with it. Null for every
+   * ordinary tab.
+   */
+  companionOf: string | null;
 }
 
 /**
@@ -638,7 +645,12 @@ interface AppStore {
   removeGroup: (id: string) => Promise<void>;
 
   /** Opens a tab in the active pane and focuses it. */
-  addTab: (info: SessionInfo, profile: SessionProfile, state?: SessionState) => void;
+  addTab: (
+    info: SessionInfo,
+    profile: SessionProfile,
+    state?: SessionState,
+    companionOf?: string | null,
+  ) => void;
   updateTabInfo: (id: string, info: SessionInfo) => void;
   closeTab: (id: string) => Promise<void>;
   /**
@@ -967,7 +979,7 @@ export const useStore = create<AppStore>((set, get) => ({
     get().bumpSenderLibrary();
   },
 
-  addTab(info, profile, state = "connected") {
+  addTab(info, profile, state = "connected", companionOf: string | null = null) {
     const { tabs, panes, activePaneId } = get();
     const taken = new Set(tabs.map((tab) => tab.number));
     let number = 1;
@@ -991,6 +1003,7 @@ export const useStore = create<AppStore>((set, get) => ({
       cols: 80,
       rows: 24,
       paneId: activePaneId,
+      companionOf,
     };
     set({
       tabs: [...tabs, tab],
@@ -1048,6 +1061,12 @@ export const useStore = create<AppStore>((set, get) => ({
       ),
       closePrompt: closePrompt && closePrompt.length > 0 ? closePrompt : null,
     });
+    // An SSH connection's SFTP companion is anonymous and derived: it goes
+    // with the connection, without a confirmation of its own. A companion
+    // has no companion of its own, so this cannot recurse.
+    for (const tab of get().tabs) {
+      if (tab.companionOf === id) await get().closeTab(tab.info.id);
+    }
   },
 
   requestCloseTab(id) {

@@ -38,6 +38,7 @@ const makeTab = (id: string, paneId = ROOT, state: SessionState = "connected"): 
   activityKind: "command",
   cols: 80,
   rows: 24,
+  companionOf: null,
   paneId,
 });
 

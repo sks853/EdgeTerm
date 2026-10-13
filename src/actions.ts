@@ -156,15 +156,24 @@ export async function ensureController(id: string): Promise<TerminalController> 
  *
  * `reuseSessionId` puts the new session on that session's SSH connection
  * instead of dialling one of its own; see `duplicateSshChannel`.
+ *
+ * `companionOf` names the SSH session this tab is the SFTP view of; see
+ * `openSftpCompanion`. It is what ties the two together when one closes.
  */
 export async function openSession(
   profile: SessionProfile,
   reuseSessionId?: string,
+  companionOf?: string | null,
 ): Promise<string | null> {
   const id = newSessionId();
   useStore
     .getState()
-    .addTab(pendingSessionInfo(id, profile), profile, "connecting");
+    .addTab(
+      pendingSessionInfo(id, profile),
+      profile,
+      "connecting",
+      companionOf ?? null,
+    );
   if (!isFileSession(profile.kind)) await ensureController(id);
   return connectSession(id, profile, reuseSessionId);
 }
@@ -191,6 +200,69 @@ export async function duplicateSshChannel(id: string): Promise<string | null> {
 /** Whether `tab` has a live SSH connection to open another channel on. */
 export const canDuplicateSshChannel = (tab: Tab): boolean =>
   tab.info.kind === "ssh" && tab.state === "connected";
+
+/**
+ * The profile an SSH connection's SFTP companion runs under: the same
+ * server, reached over the connection the SSH session already authenticated
+ * (`reuseSessionId`), with an empty id so it is nobody's saved session — it
+ * never reaches the Session panel's SFTP list and is not restored on the
+ * next start. Only the kind and the name differ, the name carrying the
+ * marker that tells the two tabs apart in a strip.
+ */
+export const companionProfile = (parent: Tab): SessionProfile => ({
+  ...parent.profile,
+  id: "",
+  kind: "sftp",
+  name: `${tabTitle(parent)} (SFTP)`,
+});
+
+/**
+ * Opens the SFTP companion an SSH connection carries: a file-transfer tab on
+ * the connection the shell just authenticated, in the same pane. A tab that
+ * shares a connection (Duplicate SSH Channel) rides the companion its
+ * connection already has; a reconnect replaces the one the dropped
+ * connection took with it. Resolves to the companion's tab id, or null when
+ * there is nothing to open or the server has no sftp subsystem.
+ */
+export async function openSftpCompanion(parentId: string): Promise<string | null> {
+  const store = useStore.getState();
+  const parent = store.tabs.find((tab) => tab.info.id === parentId);
+  if (!parent || parent.info.kind !== "ssh" || parent.info.sharedConnection) {
+    return null;
+  }
+  // A reconnect lands here with the old connection's companion still open
+  // on a transport that is gone; close it before the new one takes its place.
+  for (const tab of store.tabs) {
+    if (tab.companionOf === parentId) await store.closeTab(tab.info.id);
+  }
+
+  // addTab activates what it adds, so the companion opens focused; the shell
+  // the user just asked for takes the focus back, unless they moved on to
+  // another tab while the companion was connecting.
+  const previousActive = store.activeId;
+  const companionId = await openSession(companionProfile(parent), parentId, parentId);
+  const current = useStore.getState();
+  // A failed open resolves to null but leaves its tab behind in the error
+  // state; a server without the sftp subsystem would otherwise show a failed
+  // tab on every connect, and the shell is the tab that matters.
+  const failed = current.tabs.find(
+    (tab) => tab.companionOf === parentId && tab.state === "error",
+  );
+  if (failed) {
+    await current.closeTab(failed.info.id);
+    return null;
+  }
+  if (!companionId) return null;
+  if (
+    current.activeId === companionId &&
+    previousActive !== null &&
+    previousActive !== companionId &&
+    current.tabs.some((tab) => tab.info.id === previousActive)
+  ) {
+    current.setActive(previousActive);
+  }
+  return companionId;
+}
 
 /**
  * Split Right / Split Down: opens another session of the tab's profile in
@@ -340,6 +412,13 @@ async function connectSession(
     // first resize command could not be delivered. Re-send the current size.
     if (!isFileSession(info.kind)) {
       void api.resizeSession(id, tab.cols, tab.rows).catch(() => undefined);
+    }
+    // An SSH connection brings its SFTP view with it: one file-transfer tab
+    // on the same connection, anonymous — not a saved session, and gone with
+    // the connection. A tab that shares a connection rides the companion
+    // its connection already has; see `openSftpCompanion`.
+    if (info.kind === "ssh" && !info.sharedConnection) {
+      void openSftpCompanion(id).catch(() => undefined);
     }
     return id;
   } catch (e) {

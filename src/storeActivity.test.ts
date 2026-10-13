@@ -33,6 +33,7 @@ const makeTab = (id: string): Tab => ({
   activityKind: "command",
   cols: 80,
   rows: 24,
+  companionOf: null,
   paneId: initialState.activePaneId,
 });
 
