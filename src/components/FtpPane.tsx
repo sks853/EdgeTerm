@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import * as api from "../api";
 import { FileIcon } from "./FileIcon";
 import { Icon } from "./icons";
+import { LOCAL_PATH_SOURCE, lastPath, pathSource, rememberPath } from "../lastPaths";
 import { useStore, type Tab } from "../store";
 import type { FileEntry } from "../types";
 
@@ -43,6 +44,10 @@ export function FtpPane({ tab, active }: Props) {
   const sessionId = tab.info.id;
   // The pane serves both FTP and SFTP file sessions; only the labels differ.
   const protocolLabel = tab.info.kind === "sftp" ? "SFTP" : "FTP";
+  // The key the remote side is remembered under: a companion rides its SSH
+  // connection, whose id outlives the reconnect that hands the companion a
+  // new tab, so a dropped and reconnected session resumes where it was.
+  const remoteSource = pathSource(tab, sessionId);
 
   const [remoteHome, setRemoteHome] = useState("");
   const [remotePath, setRemotePath] = useState("");
@@ -65,7 +70,7 @@ export function FtpPane({ tab, active }: Props) {
   const [transfer, setTransfer] = useState<TransferState | null>(null);
 
   const loadRemote = useCallback(
-    async (target: string) => {
+    async (target: string, quiet = false): Promise<boolean> => {
       setRemoteLoading(true);
       setRemoteError(null);
       try {
@@ -74,33 +79,42 @@ export function FtpPane({ tab, active }: Props) {
         setRemoteDraft(listing.path);
         setRemoteEntries(listing.entries);
         setRemoteSelected(null);
+        rememberPath(remoteSource, listing.path);
+        return true;
       } catch (error) {
-        setRemoteError(friendlyFtpError(error));
+        if (!quiet) setRemoteError(friendlyFtpError(error));
+        return false;
       } finally {
         setRemoteLoading(false);
       }
     },
-    [sessionId],
+    [remoteSource, sessionId],
   );
 
-  const loadLocal = useCallback(async (target: string) => {
-    const request = ++localRequest.current;
-    setLocalLoading(true);
-    setLocalError(null);
-    try {
-      const listing = await api.localList(target);
-      if (request !== localRequest.current) return;
-      setLocalPath(listing.path);
-      setLocalDraft(listing.path);
-      setLocalEntries(listing.entries);
-      setLocalSelected(null);
-    } catch (error) {
-      if (request !== localRequest.current) return;
-      setLocalError(String(error));
-    } finally {
-      if (request === localRequest.current) setLocalLoading(false);
-    }
-  }, []);
+  const loadLocal = useCallback(
+    async (target: string, quiet = false): Promise<boolean> => {
+      const request = ++localRequest.current;
+      setLocalLoading(true);
+      setLocalError(null);
+      try {
+        const listing = await api.localList(target);
+        if (request !== localRequest.current) return false;
+        setLocalPath(listing.path);
+        setLocalDraft(listing.path);
+        setLocalEntries(listing.entries);
+        setLocalSelected(null);
+        rememberPath(LOCAL_PATH_SOURCE, listing.path);
+        return true;
+      } catch (error) {
+        if (request !== localRequest.current) return false;
+        if (!quiet) setLocalError(String(error));
+        return false;
+      } finally {
+        if (request === localRequest.current) setLocalLoading(false);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (tab.state !== "connected") return;
@@ -115,7 +129,19 @@ export function FtpPane({ tab, active }: Props) {
         if (cancelled) return;
         setRemoteHome(ftpHome);
         setLocalHome(machineHome);
-        await Promise.all([loadRemote(ftpHome), loadLocal(machineHome)]);
+        // Resume where each side was last browsed; home only the first
+        // time, or when that directory no longer lists. A reconnect opens
+        // a new companion tab, but it rides the same connection, so the
+        // remote side picks up where the dropped one left off.
+        const remoteLast = lastPath(remoteSource);
+        if (remoteLast === undefined || !(await loadRemote(remoteLast, true))) {
+          if (cancelled) return;
+          await loadRemote(ftpHome);
+        }
+        const localLast = lastPath(LOCAL_PATH_SOURCE);
+        if (localLast === undefined || !(await loadLocal(localLast, true))) {
+          if (!cancelled) await loadLocal(machineHome);
+        }
       } catch (error) {
         if (!cancelled) setRemoteError(friendlyFtpError(error));
       }
@@ -124,7 +150,7 @@ export function FtpPane({ tab, active }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [loadLocal, loadRemote, sessionId, tab.state]);
+  }, [loadLocal, loadRemote, remoteSource, sessionId, tab.state]);
 
   const selectedRemote = remoteEntries.find(
     (entry) => entry.path === remoteSelected,

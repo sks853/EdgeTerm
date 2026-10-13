@@ -11,6 +11,7 @@ import {
 
 import { revealCwdInFiler } from "../../actions";
 import * as api from "../../api";
+import { lastPath, pathSource, rememberPath } from "../../lastPaths";
 import { open as openDialog, save as saveDialog } from "../../nativeDialog";
 import { IS_MAC, IS_WINDOWS } from "../../platform";
 import { chordLabel } from "../../shortcuts";
@@ -114,26 +115,6 @@ interface DropVerdict {
 const dropPoint = (position: PhysicalPosition): { x: number; y: number } =>
   IS_WINDOWS ? position.toLogical(window.devicePixelRatio) : position;
 
-/** `lastPaths` key for the local file system, which every local tab shares. */
-const LOCAL_SOURCE = "";
-
-/**
- * The directory last shown for each source (a remote session id, or
- * `LOCAL_SOURCE`), so switching back to a session returns to where the user
- * was browsing instead of its home (issue #74). Module level so hiding the
- * panel keeps it too; entries for closed sessions are pruned as others are
- * recorded.
- */
-const lastPaths = new Map<string, string>();
-
-const rememberPath = (source: string, path: string) => {
-  const open = new Set(useStore.getState().tabs.map((tab) => tab.info.id));
-  for (const key of lastPaths.keys()) {
-    if (key !== LOCAL_SOURCE && !open.has(key)) lastPaths.delete(key);
-  }
-  lastPaths.set(source, path);
-};
-
 export function FilerPanel() {
   const tab = useActiveTab();
   const theme = useStore((s) => s.theme);
@@ -153,6 +134,8 @@ export function FilerPanel() {
   // Null for every session without remote files, so switching between local tabs does not
   // count as a source change and reset where the user was browsing.
   const remoteId = remote ? (tab?.info.id ?? null) : null;
+  /** The key this panel's directory memory is kept under; see `lastPaths`. */
+  const source = pathSource(tab, remoteId);
   const filerTarget = useStore((s) => s.filerTarget);
   const revealKey = useStore((s) => chordLabel(s.shortcuts.revealCwd));
   /** The last `filerTarget.token` this panel navigated to. */
@@ -402,7 +385,7 @@ export function FilerPanel() {
         setDraft(listing.path);
         setEntries(listing.entries);
         setSelected(null);
-        rememberPath(remoteId ?? LOCAL_SOURCE, listing.path);
+        rememberPath(source, listing.path);
         return true;
       } catch (e) {
         if (!quiet) setError(String(e));
@@ -411,7 +394,7 @@ export function FilerPanel() {
         setBusy(false);
       }
     },
-    [remoteId, offline],
+    [remoteId, source, offline],
   );
 
   /**
@@ -449,7 +432,7 @@ export function FilerPanel() {
         }
         // Coming back to a session resumes where it was browsed; home only
         // the first time, or when that directory no longer lists.
-        const last = lastPaths.get(remoteId ?? LOCAL_SOURCE);
+        const last = lastPath(source);
         if (last !== undefined && (await load(last, true))) return;
         if (cancelled) return;
         const home = remoteId
@@ -463,7 +446,7 @@ export function FilerPanel() {
     return () => {
       cancelled = true;
     };
-  }, [remoteId, offline, load]);
+  }, [remoteId, source, offline, load]);
 
   useEffect(() => {
     const target = claimTarget();
