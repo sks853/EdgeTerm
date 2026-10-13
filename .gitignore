@@ -39,3 +39,6 @@ Thumbs.db
 *.sln
 *.sw?
 .serena/
+
+# Agent workspace: memory, change log, test scratch
+/.workbuddy/
